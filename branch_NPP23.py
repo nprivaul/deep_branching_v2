@@ -9,7 +9,7 @@ from fdb import fdb_nd
 torch.manual_seed(0)  # set seed for reproducibility
 
 
-class Net(torch.nn.Module):
+class Net_NPP23(torch.nn.Module):
     """
     deep branching approach to solve PDE with utility functions
     """
@@ -29,12 +29,19 @@ class Net(torch.nn.Module):
         layers=5,
         branch_lr=1e-2,
         weight_decay=0,
-        branch_nb_path_per_state=300,
-        branch_nb_states=1000,
-        branch_nb_states_per_batch=1000,
-        epochs=3000,
+        branch_nb_path_per_state=1000,
+        branch_nb_states=100, 
+        branch_nb_states_per_batch=1,
+#        branch_nb_path_per_state=100,
+#        branch_nb_states=10000, 
+#        branch_nb_states_per_batch=1000,
+#        branch_nb_path_per_state=10000,
+#        branch_nb_states=100, 
+#        branch_nb_states_per_batch=200,
+        epochs=500,
         batch_normalization=True,
-        antithetic=True,
+        antithetic=False,
+#        antithetic=True,
         overtrain_rate=0.1,
         device="cpu",
         branch_activation="tanh",
@@ -46,7 +53,7 @@ class Net(torch.nn.Module):
         code=None,
         **kwargs,
     ):
-        super(Net, self).__init__()
+        super(Net_NPP23, self).__init__()
         self.f_fun = f_fun
         self.phi_fun = phi_fun
         self.deriv_map = deriv_map
@@ -369,6 +376,8 @@ class Net(torch.nn.Module):
             idx = (unif * len(L)).long()
             idx_counter = 0
 
+#            print(L)
+#            print(len(L))
             # loop through all fdb elements
             for fdb in L:
                 mask_tmp = mask_now * (idx == idx_counter)
@@ -384,6 +393,7 @@ class Net(torch.nn.Module):
                     np.array(fdb.lamb) + 1,
                     patch,
                 )
+                #print("A=",A[mask_tmp])
 
                 for ll, k_arr in fdb.l_and_k.items():
                     for q in range(self.n):
@@ -559,6 +569,84 @@ class Net(torch.nn.Module):
             torch.cat(yy),
         )
 
+    def gen_sample_mc_time(self, patch, tx=None, ttx=None, t_lo=None, t_hi=None, nb_time=None):
+        """
+        Generate samples for u based on `adjusted_t_boundaries`,
+        `adjusted_x_boundaries` and the function `gen_sample_batch`.
+
+        Parameters
+        ----------
+        patch : int
+            The current patch index.
+        """
+        nb_states = self.nb_states
+        states_per_batch = min(nb_states, self.nb_states_per_batch)
+        batches = math.ceil(nb_states / states_per_batch) if tx is None else 1
+        # t_lo, t_hi = self.adjusted_t_boundaries[patch]
+        # print("t_boundaries[patch]=",self.t_boundaries[patch])
+        # print("t_hi=",t_hi)
+        # print("delta_t=",self.delta_t)
+        x_lo, x_hi = self.adjusted_x_boundaries
+        # print("x_hi=",x_hi)
+        xx, yy = [], []
+        for _ in range(batches):
+            unif = (
+                torch.rand(states_per_batch, device=self.device)
+                .repeat(self.nb_path_per_state)
+                .reshape(self.nb_path_per_state, -1)
+                .T
+            )
+            t = t_lo + 0 * (t_hi - t_lo) * unif
+#            print("t=",t)
+            unif = (
+                torch.rand(self.dim * states_per_batch, device=self.device)
+                .repeat(self.nb_path_per_state)
+                .reshape(self.nb_path_per_state, -1)
+                .T.reshape(self.dim, states_per_batch, self.nb_path_per_state)
+            )
+            if tx is None:
+                x = x_lo + (x_hi - x_lo) * unif
+                # fix all dimensions (except the first) to be the middle value
+                if self.dim > 1 and self.fix_all_dim_except_first:
+                    x[1:, :, :] = (x_hi + x_lo) / 2
+                xx.append(torch.cat((t[:, :1], x[:, :, 0].T), dim=-1).detach())
+            else:
+                t = ttx[:, 0].unsqueeze(-1).repeat((1, self.nb_path_per_state))
+                x = tx[:, 1:].T.unsqueeze(-1).repeat((1, 1, self.nb_path_per_state))
+                xx.append(tx)
+            T = torch.linspace(t_lo, t_hi, nb_time, device=self.device).unsqueeze(-1).repeat((1, self.nb_path_per_state)) # (t_lo + self.delta_t) * torch.ones_like(t)
+            # print("T=",T)
+            # print("other=",(t_lo + self.delta_t) * torch.ones_like(t))
+            yyy = []
+            self.code = np.array([0] * self.dim) 
+            yy_tmp = self.gen_sample_batch(
+                t,
+                T,
+                x,
+                torch.ones_like(t),
+                self.code,
+                patch,
+            ).detach()
+                # let (lo, hi) be
+                # (self.outlier_percentile, 100 - self.outlier_percentile)
+                # percentile of yy_tmp
+                #
+                # set the boundary as [lo-1000*(hi-lo), hi+1000*(hi-lo)]
+                # samples out of this boundary is considered as outlier and removed
+            lo, hi = (
+                yy_tmp.nanquantile(self.outlier_percentile/100, dim=1, keepdim=True),
+                yy_tmp.nanquantile(1 - self.outlier_percentile/100, dim=1, keepdim=True)
+            )
+            lo, hi = lo - self.outlier_multiplier * (hi - lo), hi + self.outlier_multiplier * (hi - lo)
+            mask = torch.logical_and(lo <= yy_tmp, yy_tmp <= hi)
+            yyy.append((yy_tmp.nan_to_num() * mask).sum(dim=1) / mask.sum(dim=1))
+        yy.append(torch.stack(yyy, dim=-1))
+
+        return (
+            torch.cat(xx),
+            torch.cat(yy),
+        )
+
     def train_and_eval(self, debug_mode=False):
         """
         generate sample and evaluate (plot) NN approximation when debug_mode=True
@@ -654,14 +742,13 @@ class Net(torch.nn.Module):
 if __name__ == "__main__":
     # configurations
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    T, x_lo, x_hi, dim = .05, -4.0, 4.0, 3
+    T, x_lo, x_hi, dim = .5, -8.0, 8.0, 100
     # deriv_map is n x d array defining lambda_1, ..., lambda_n
     deriv_map = np.array(
         [
-            [0, 0, 0],
-            [1, 0, 0],
-            [0, 1, 0],
-            [0, 0, 1],
+         torch.zeros(dim, dtype=torch.int),
+#            [0, 0, 0, 0, 0],
+#            [0],
         ]
     )
 
@@ -670,14 +757,22 @@ if __name__ == "__main__":
         idx 0      -> no deriv
         idx 1 to d -> first deriv
         """
-        return y[1:].sum(dim=0) + dim * torch.exp(-y[0]) * (1 - 2 * torch.exp(-y[0]))
+        return 6 + 4*torch.exp(-y) - 10*torch.exp(-y/2) + torch.exp(y/2) - torch.exp(y)
+        # return y[1:].sum(dim=0) + dim * torch.exp(-y[0]) * (1 - 2 * torch.exp(-y[0]))
 
     def g_fun(x):
-        return torch.log(1 + x.sum(dim=0) ** 2)
+        return 2*torch.log(1 + 1/(1 + torch.exp(x.sum(dim=0)/np.sqrt(dim))));
+        # return torch.log(1 + x.sum(dim=0) ** 2)
 
+    def phi(x):
+        return 2*np.log(1 + 1/(1 + np.exp(x.sum(axis=0)/np.sqrt(dim))));
+        # return np.exp(np.sqrt(2.0)*x.sum(axis=0))
+        #return np.exp(2*x.sum(axis=0))
+        #return -0.5 - 0.5 * np.tanh(-x.sum(axis=0)/np.sqrt(dim) / 2)
+        #return np.exp(x.sum(axis=0));
 
     # initialize model and training
-    model = Net(
+    model_NPP23 = Net_NPP23(
         deriv_map=deriv_map,
         f_fun=f_fun,
         phi_fun=g_fun,
@@ -687,17 +782,23 @@ if __name__ == "__main__":
         device=device,
         verbose=True,
     )
-    model.train_and_eval()
+    model_NPP23.train_and_eval()
 
 
     # define exact solution and plot the graph
     def exact_fun(t, x, T):
-        return np.log(1 + (x.sum(axis=0) + dim * (T - t)) ** 2)
-
+        return 2*np.log(1 + 1/(1 + np.exp(x.sum(axis=0)/np.sqrt(dim) - (T - t))))
+        #return np.exp(2*x.sum(axis=0) + (T-t))
+        # return np.exp(np.sqrt(2)*x.sum(axis=0) + (T-t))
+        #return -0.5 - 0.5 * np.tanh(-x.sum(axis=0)/np.sqrt(dim)/2 + 3*(T-t)/4)
+#        return (x.sum(axis=0))**2+(T - t)
     grid = torch.linspace(x_lo, x_hi, 100).unsqueeze(dim=-1)
-    nn_input = torch.cat((torch.zeros((100, 1)), grid, torch.zeros((100, 2))), dim=-1).to(device)
-    plt.plot(grid, model(nn_input).cpu().detach(), label="Deep branching")
+    nn_input = torch.cat((torch.zeros((100, 1)), grid, torch.zeros((100, dim-1))), dim=-1).to(device)
+    plt.plot(grid, model_NPP23(nn_input).cpu().detach(), label="Deep branching")
     plt.plot(grid, exact_fun(0, nn_input[:, 1:].cpu().numpy().T, T), label="True solution")
+    plt.plot(grid, phi(nn_input[:, 1:].cpu().numpy().T), label="Terminal condition")
+    plt.grid()
     plt.legend()
     plt.savefig("plot/final/demo.png", bbox_inches='tight')
     plt.show()
+    
